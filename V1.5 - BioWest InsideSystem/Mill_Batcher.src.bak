@@ -1,0 +1,3474 @@
+------------------------------------------------------------------------------
+-- Program Name: Mill_Batcher 
+--
+-- Copyright 2011 Total Scale Service inc. as an unpublished work. 
+-- All Rights Reserved.
+--
+-- The information contained herein is confidential property of 
+--  Total Scale Service inc.  The use, copying, transfer or disclosure of such
+-- information is prohibited except by express written agreement with
+--  Total Scale Service inc.
+--
+-- First written on 11/22/2011 by Sean Solleder.
+--
+-- Module Description:
+-- This file is the iRite source code for a 920i program.
+--
+-- This program will be Used to run the batch plant in Beef Northewest Nyssa 
+-- Oregon
+------------------------------------------------------------------------------
+
+program Mill_Batcher;
+
+#include test-import.iri  
+
+  ----------------------------------------------------------------------------
+  -- Begin constants and aliases definitions here.
+  
+  g_csProgName : constant string := "Mill_Batcher";  
+  g_csVersion : constant string := "04.18.12";
+ 
+  -- End of constants and aliases.
+  ----------------------------------------------------------------------------
+  
+
+  ----------------------------------------------------------------------------
+  -- Begin user created types (enumerations, records, arrays) definitions.
+  type StringArray is array[50] of string;
+  type RealArray is array[50] of real;
+  type IntArray is array[50] of integer;
+  
+
+  -- End of user created types (enumerations, records, arrays).
+  ----------------------------------------------------------------------------
+
+
+
+  ----------------------------------------------------------------------------
+  -- Start global variables definitions here.  Don't forget to initialize 
+  -- them in the system startup event handler.
+  
+  g_StartingWeight : real;      -- Records amount tore off when starting batch for display purposes.
+  g_srcResult    : SysCode;
+  g_Bit:    integer  :=0;   -- Keeps track of the Estop status.  0=Good, 1=Stop   
+  g_Count : integer;    -- Currently Selected Ration from knob
+  g_Key : integer; 
+  g_Level : integer :=0;
+  g_MaxRations : integer :=50;
+  g_MaxIngredients  : integer :=26; 
+  g_SubLevel : integer :=0;
+  g_BitStatus : integer;
+  g_CurrentRation :  string := "";  
+  g_CurIngredient : string;
+  g_RecordCount : integer;    
+  g_CurrentTarget : integer;
+  g_CurrentSp : integer;
+  g_IngredNames : stringarray;  
+  g_SPValues : realarray;   
+  g_SpPreact : realarray;  
+  g_SpMin : realarray;                -- Stores the early cutoff value for an ingredient in a ration
+  g_SpMax : realarray;
+  g_SpOut : IntArray;
+  g_Load :  integer;
+  g_WaitSp : integer;  -- Used to bypass calculations and flag errors after ingredient has dispensed.
+  g_CurSpValue : real;
+  g_FillStep    : integer;  -- Used to store whether ingredients are filled with fast / slow or just a fast fill method
+  g_PageStart   : integer;
+  g_ScaleRationTargetWeight : real;   -- Stores the Total weight to be dispensed into scale for a ration
+    
+  -- End of global variables.  
+  ----------------------------------------------------------------------------
+
+
+  ----------------------------------------------------------------------------
+  -- Start functions and procedures definitions here.    
+function GetFactor : real;
+--Declaration Section
+Factor : real;
+R_Names : R_NamesDatabase;
+begin
+    R_Names.Name:=g_CurrentRation;
+    R_Names.FindFirst(R_Names_Name);
+    -- WriteLn(2,"Getting Factor g_CurrentTarget = ",RealToString(g_CurrentTarget,0,3));
+    -- WriteLn(2,"Getting Factor R_Names.Total = ",RealToString(R_Names.Total,0,3));
+    if R_Names.Total > 0 then
+       Factor:=g_CurrentTarget/R_Names.Total;
+    else
+       Factor :=1;    
+    end if;
+
+
+    return(Factor);
+
+end;
+
+
+  
+  
+procedure UnloadToTruck;
+--Declaration Section
+
+begin
+      SetLabelText(Lbl3S2,"");
+      SetLabelText(Lbl4S2,"Unloading");
+      SetLabelText(Lbl5S2,"Tank");
+      --ResetBatch;
+      
+      SetSoftkeyText(1,"Cancel");
+      SetSoftkeyText(2,"");
+      SetSoftkeyText(3,"Pause");
+      SetSoftkeyText(4,"");
+      SetSoftkeyText(5,"");   
+      --DisableSP(99);                   
+    return;
+
+end;
+
+
+
+procedure TareScale;
+--Declaration Section
+lCount : integer;
+lindex : integer;             
+Net : real ;
+
+
+begin 
+     
+     WriteLn(2,"Tare Scale Called");
+     lCount:=0;    -- used as a loop counter.  After 20 failures to Tare Scale user is notified
+     
+     while lCount<=100
+     loop
+       
+       lCount:=lCount+1;   
+       if AcquireTare(Scale1)=SysOk then
+       
+         GetNet(scale1,Primary,Net);
+         if Net<5 then
+          
+           WriteLn(2,"Aquire Tare Good - Net within 5 of Zero  Net = "+RealToString(Net,0,0));
+           SetLabelText(Lbl3S2,"");
+           exit;
+         
+         else
+         
+           WriteLn(2,"Aquire Tare Good - Net NOT WITHIN 5 of Zero  Net = "+RealToString(Net,0,0));
+           
+         end if;
+       
+       else                                                             
+       
+         WriteLn(2,"Aquire Tare Fail - Current Net = "+RealToString(Net,0,0));
+         
+       end if;
+       SetLabelText(Lbl3S2,"Taring Scale..."+IntegerToString(lCount,0));          
+       
+       -- Pause to give scale a chance to settle down
+       for lindex := 1 to 10000
+       loop
+       
+         if lindex=5000 then  -- Check scale at half way mark.
+           if AcquireTare(Scale1)=SysOk then
+             exit;
+           end if;
+         end if;
+        
+       end loop;  
+       
+     end loop;            
+     if lCount>=99 then
+      WriteLn(2,"Attempt to Tare Failed.  Batch should be paused"); 
+      g_SubLevel:=1;                
+      PauseBatch;
+         
+     end if;
+   return;
+
+end;
+
+  
+procedure StoreLoad(Cancelled : integer);
+--Declaration Section
+LoadDb : LoadsDatabase;
+RationIngredDB : R_IngredDatabase;
+Net : real;
+Factor : real;
+begin         
+    Factor:=GetFactor;
+    GetNet(Scale1,Primary,Net);
+    RationIngredDB.GetFirst;
+    loop
+      if RationIngredDB.Ration=g_CurrentRation and RationIngredDB.Ingred=g_CurIngredient then
+        exit;
+      end if;
+      if RationIngredDB.GetNext<>SysOk then 
+        exit;
+      end if;          
+    end loop;
+    LoadDb.Date:=SystemTime;
+    LoadDB.Load:=g_Load;     
+    LoadDB.Ingred := g_CurIngredient;
+    LoadDB.Target:=RationIngredDB.Target*Factor;
+
+    LoadDB.Actual:=Net;
+    LoadDB.Ration:=g_CurrentRation;
+    LoadDB.Sent:=0;    
+    if Cancelled=1 then
+       LoadDB.Status:=3;
+    elsif Net < RationIngredDB.Target-RationIngredDB.Min then
+       LoadDB.Status:=1;
+    elsif Net > RationIngredDB.Target+RationIngredDB.Max then
+       LoadDB.Status:=2;
+    else 
+       LoadDB.Status:=0;
+    end if;
+    
+    LoadDB.Add;
+    
+        
+    return;
+
+end;
+
+
+
+procedure EnableHandelers;
+--Declaration Section
+
+begin        
+    EnableHandler(Numerickeypressed);
+    EnableHandler(Navupkeypressed);
+    EnableHandler(Navdownkeypressed);
+    
+
+
+
+    return;
+
+end;
+  
+
+procedure DisableHandlers;
+--Declaration Section
+
+begin        
+    DisableHandler(Numerickeypressed);
+    DisableHandler(Navupkeypressed);
+    DisableHandler(Navdownkeypressed);
+    
+
+
+
+    return;
+
+end;
+  
+  
+  procedure InitializeDatabase;
+--Declaration Section
+Setup : SetupDatabase;
+ingred : IngredDatabase;
+index : integer;
+begin
+
+    WriteLn(2,"Init Database Section");
+    if Setup.GetFirst<>SysOk then --Cant Find the Setup Record so Make some Default Values
+       WriteLn(2,"Setup - No Records...initializing");
+       Setup.MinLoad:=500;
+       Setup.MaxLoad:=31000;
+       Setup.FillStep:=1;
+       Setup.Update;
+    else
+        WriteLn(2,"Setup - Records found...");
+        g_FillStep:=Setup.FillStep;
+        WriteLn(2,"Fillstep= "+IntegerToString(g_FillStep,1));
+    end if;   
+    
+    if ingred.GetFirst<>SysOk then
+       WriteLn(2,"Ingredients - No Records...initializing");
+       for index := 1 to 26
+       loop
+          if ingred.GetNext<>SysOk then
+            ingred.Name:="";
+            ingred.Low_Act:=0;
+            ingred.High_Act:=0;
+            if index < 17 then 
+                ingred.Output:=index;
+            else
+                ingred.Output:=99;
+            end if;
+            ingred.Add;
+          end if;          
+       end loop;
+    else
+        WriteLn(2,"Ingredients - Records found...Good");   
+    end if;    
+    return;
+
+end;
+
+  
+  function MakeVersionString : string; 
+    
+    sTemp : string;
+    
+  begin 
+    
+    sTemp := ("Ver " + g_csVersion);
+      
+    return sTemp;
+    
+  end;  
+     
+  procedure DisplayVersion; 
+  
+  begin
+   
+    DisplayStatus(g_csProgName + "  " + MakeVersionString);
+  
+  end;
+
+--function Ingredients : StringArray;
+----Declaration Section
+--IngredName : StringArray;
+--IngredDatabaseDB : IngredDatabase;
+--index : integer;
+--begin             
+--    for Index:= 0 to 8
+--    loop
+--      IngredName[index]:="";
+--    end loop;
+--    Index:=0;
+--    if IngredDatabaseDB.GetFirst=SysOk then --No Ingred Names In The Database
+--       loop
+--         IngredName[index]:=IngredDatabaseDB.Name;
+--         Index:=Index+1;    
+--         if IngredDatabaseDB.GetNext<>SysOk or index>8 then 
+--            exit;
+--         end if;   
+--       end loop;
+--    end if;
+--    
+--    return(IngredName);
+--
+--end;
+-- 
+--
+
+
+function RationIngredients : StringArray;
+--Declaration Section
+IngredName : StringArray;
+RationIngredDB : R_IngredDatabase;
+index : integer;
+begin    
+    
+    for Index:= 1 to g_MaxIngredients               
+    loop
+      IngredName[index]:="";         
+    end loop;
+    Index:=1;
+   
+    if RationIngredDB.GetFirst=SysOk then --Their are Ration Names In The Database
+       loop
+         if RationIngredDB.Ration=g_CurrentRation then
+           IngredName[index]:=RationIngredDB.Ingred;
+           Index:=Index+1;    
+         end if;  
+         if RationIngredDB.GetNext<>SysOk or index>g_MaxRations then 
+            exit;
+         end if;   
+         
+       end loop;
+    end if;
+    return(IngredName);
+
+end;
+ 
+
+procedure UpdateDisplay;
+--Declaration Section
+LoadsDB : LoadsDatabase;
+RationIngredDB : R_IngredDatabase;    
+RationNamesDB : R_NamesDatabase;
+IngredName : StringArray;
+R_IngredName : StringArray;  
+IngredDB : IngredDatabase;
+Index : integer;
+TempIngred : StringArray;
+Bit : integer;
+CurrentSP : integer;  
+CurSpName : string;  
+CurSpValue : real;
+Net : real;   
+Gross : real;  
+Found : integer;  
+Factor : real;
+Min : real;
+Max : real;
+Start   : integer;
+Finish  : integer; 
+
+Target : real;     -- Used to Calculate and display the actual target for the ingredient not cutoff amt 
+
+begin
+    if g_Level=0 then 
+      ClearTare(1);
+      --DisableSP(50); --Unload Setpoint
+      CurrentSp:=0;       
+      g_CurrentSp:=0;
+      SelectScreen(1);
+      SetLabelText(Lbl2S1,"No Ration Selected");
+      SetLabelText(lbl3S1,"Select Ration");
+      SetLabelText(lbl4S1, "To Continue");
+       
+      SetSoftkeyText(1,"");
+      SetSoftkeyText(2,"");
+      SetSoftkeyText(3,"Select Recipe");
+      SetSoftkeyText(4,"");
+      SetSoftkeyText(5,"Setup"); 
+      g_CurrentTarget:=0;        
+      g_SubLevel:=0;
+    elsif  g_Level=2 and g_SubLevel=1 then 
+      SetLabelText(lbl1S10,"**************");
+      SetLabelText(lbl2S10,"Delete Recipe");
+      SetLabelText(lbl3S10,"");
+      SetLabelText(lbl4S10,g_CurrentRation);                        
+      SetLabelText(lbl5S10,"**************");
+      SetSoftkeyText(1,"No");
+      SetSoftkeyText(2,"");
+      SetSoftkeyText(3,"");
+      SetSoftkeyText(4,"");
+      SetSoftkeyText(5,"Yes");      
+      
+      
+    elsif g_Level=1 or g_Level=2 then --Select Ration Or Edit Ration
+      SelectScreen(10);    
+      
+      if RationNamesDB.GetFirst<>SysOk then --No Ration Names In The Database
+          g_Count:=0;
+          SetLabelText(lbl1S10,"");
+          SetLabelText(lbl2S10,"No Recipes");
+          SetLabelText(lbl3S10,"Created");
+          SetLabelText(lbl4S10,"Add A Recipe");                        
+          SetLabelText(lbl5S10,"");
+          SetSoftkeyText(1,"");
+          if g_Level=2 then
+            SetSoftkeyText(2,"Add Recipe");
+          else
+            SetSoftkeyText(2,"");
+          end if;
+            
+          SetSoftkeyText(3,"");
+          SetSoftkeyText(4,"");
+          SetSoftkeyText(5,"Cancel");
+      else  
+        
+        RationNamesDB.GetFirst;
+        index:=0;--Get the Count Of the Records
+        RationNamesDB.GetFirst;
+     
+        loop
+          if RationNamesDB.GetNext<>SysOk then 
+            exit;
+          end if;
+          index:=index+1;                               
+        end loop;
+        if g_Count>index then    -- Used to wrap display if user goes out of bounds with selection
+          g_Count:=0;
+        elsif g_Count<0 then 
+          g_Count:=index;    
+        end if;        
+        RationNamesDB.GetFirst;    
+        g_CurrentRation:=RationNamesDB.Name; 
+        if g_Count>0 then
+          for index := 1 to g_Count        
+          loop    
+            if  RationNamesDB.GetNext <>SysOk then
+              
+              RationNamesDB.GetFirst; 
+              g_CurrentRation:=RationNamesDB.Name; 
+              g_Count:=0;
+              exit;
+            end if;  
+            g_CurrentRation:=RationNamesDB.Name;  -- Set Current Ration to Each ration, last entry is the correct one
+          end loop ; 
+        end if;    
+        if g_Level=2 then
+          SetLabelText(lbl1S10,"Edit Recipe");
+          SetLabelText(lbl4S10,"Select Recipe");
+          SetLabelText(lbl5S10,"Then Press Ok");
+          SetSoftkeyText(1,"Delete Recipe");
+          if g_Count<50 then
+            SetSoftkeyText(2,"Add Recipe");
+          else
+            SetSoftkeyText(2,"");
+          end if;            
+          SetSoftkeyText(3,"Ok");           
+          SetLabelText(lbl2S10,"Recipe");
+          SetLabelText(lbl3S10,g_CurrentRation);
+
+        else     
+           
+          RationNamesDB.Name:=g_CurrentRation;
+          RationNamesDB.FindFirst(R_Names_Name);
+          if g_CurrentTarget=0 then
+            g_CurrentTarget:=RationNamesDB.Total;
+          end if;                               
+          GetDigin(0,1,Bit);   -- Emergency Stop Check
+          
+          if Bit=0 then         
+            SelectScreen(1);
+            SetLabelText(lbl2S1,"Recipe : "+g_CurrentRation);
+            SetLabelText(lbl3S1,"Total Load Weight");
+            SetLabelText(lbl4S1,IntegerToString(g_CurrentTarget,0)+" lbs");
+            SetSoftkeyText(1,"Change Load Size");
+            SetSoftkeyText(2,""); 
+            SetSoftkeyText(3,"Start Batch");
+          else 
+            SelectScreen(1);
+            SetLabelText(lbl2S1,"Emergency");
+            SetLabelText(lbl3S1,"Stop");
+            SetLabelText(lbl4S1,"Activated");
+            SetSoftkeyText(1,"");
+            SetSoftkeyText(2,""); 
+            SetSoftkeyText(3,"");
+          
+          end if;  
+        end if;        
+       
+        SetSoftkeyText(4,"");
+        SetSoftkeyText(5,"Cancel");
+ 
+      end if;               
+                   
+    elsif g_Level=3 then --Enter Setup
+      SelectScreen(10);
+      SetLabelText(Lbl1S10,"");
+      SetLabelText(Lbl2S10,"");
+      SetLabelText(Lbl3S10,"*** System Setup  ***");
+      SetLabelText(Lbl4S10,"");
+      SetLabelText(Lbl5S10,"");
+      SetSoftkeyText(1,"Edit Recipe");
+      SetSoftkeyText(2,"Edit Ingredients");
+      SetSoftkeyText(3,"Set Time");
+      SetSoftkeyText(4,"");
+      SetSoftkeyText(5,"Done");
+      
+    elsif g_Level=4 then --Edit Ingredients
+          
+      SelectScreen(3);
+      if g_PageStart = 0 then
+        WriteLn(2,"Top Menu");
+        if g_Count>15 then
+            g_Count:=0;
+        elsif g_Count<0 then
+            g_Count:=15;
+        end if;                      
+        for index := 0 to 15 
+        loop                 
+            if index=0 then
+              IngredDB.GetFirst;
+            else
+              IngredDB.GetNext;
+            end if;
+                  
+            if g_Count=index then
+                --SetWidgetVisibility(Lbl11S3+index,VOn); 
+                SetLabelText(79+index,"-->>" );     
+                g_CurIngredient:=IngredDB.Name;
+            else  
+                SetLabelText(79+index,"" ); 
+                --SetWidgetVisibility(Lbl11S3+index,VOff);
+            end if;                         
+            --SetWidgetVisibility(Lbl1S3+index,VOn);
+            if IngredDB.Name="" then
+                SetLabelText(6+index,"(Not Setup)");
+            else
+                SetLabelText(6+index,IngredDB.Name);
+            end if;
+        end loop;                                     
+          
+        SetLabelText(Lbl17S3,"*** Ingredient Setup ***");
+        SetLabelText(Lbl18S3,"Select Ingredient To Edit"); 
+        SetSoftkeyText(1,"Edit Name"); 
+        if g_CurIngredient="" then
+            SetSoftkeyText(2,"");
+            SetSoftkeyText(3,"");
+        else
+            SetSoftkeyText(2,"Edit CutOff");
+            if g_FillStep = 2 then
+                SetSoftkeyText(3,"Edit Low Preact");
+            else
+                SetSoftkeyText(3,"Edit Output");
+            end if;
+        end if;  
+        SetSoftkeyText(4,"Page 2");
+          
+      else
+      
+        Start:=16;
+        WriteLn(2,"Bottom Menu");
+        if g_Count>25 then
+            g_Count:=Start;
+        elsif g_Count<Start then
+            g_Count:=25;
+        end if;                          
+        SelectScreen(3);
+            
+        for index := 0 to 25 
+        loop                 
+            if index=0 then
+              IngredDB.GetFirst;
+            else
+              IngredDB.GetNext;
+            end if;
+            if index > Start-1 then      
+                if g_Count=index then
+                    --SetWidgetVisibility(Lbl11S3+index,VOn); 
+                    SetLabelText(79+index-Start,"-->>" );     
+                    g_CurIngredient:=IngredDB.Name;
+                else  
+                    SetLabelText(79+index-Start,"" ); 
+                    --SetWidgetVisibility(Lbl11S3+index,VOff);
+                end if;                         
+                --SetWidgetVisibility(Lbl1S3+index,VOn);
+                if IngredDB.Name="" then
+                    SetLabelText(6+index-Start,"(Not Setup)");
+                else
+                    SetLabelText(6+index-Start,IngredDB.Name);
+                end if;
+            end if;
+        end loop;                                     
+        -- Clear Remaining Choices
+        for index:=10 to 15
+        loop
+            SetLabelText(79+index,"" );      
+            SetLabelText(6+index,"");
+        end loop;
+        SetLabelText(Lbl17S3,"*** Ingredient Setup ***");
+        SetLabelText(Lbl18S3,"Select Ingredient To Edit"); 
+        SetSoftkeyText(1,"Edit Name"); 
+        if g_CurIngredient="" then
+            SetSoftkeyText(2,"");
+            SetSoftkeyText(3,"");
+        else
+            SetSoftkeyText(2,"Edit CutOff");
+            if g_FillStep = 2 then
+                SetSoftkeyText(3,"Edit Low Preact");
+            else
+                SetSoftkeyText(3,"Edit Output");
+            end if;
+        end if;  
+        SetSoftkeyText(4,"Page 1");
+      
+     
+        SetSoftkeyText(5,"Done");
+      end  if;
+    elsif g_Level=5 then   --- Add/ Edit Ingredients For Ration                     
+      SelectScreen(3); 
+      RationNamesDB.Name:=g_CurrentRation;
+      RationNamesDB.FindFirst(R_Names_Name); 
+      SetLabelText(Lbl17S3,"Edit Recipe : "+g_CurrentRation);       
+      SetLabelText(Lbl18S3,"Total Load Weight ="+IntegerToString(RationNamesDB.Total,0));       
+      --Get a list of Rations Ingredients Matching the Ration Selected
+      IngredName:=RationIngredients;
+      g_RecordCount :=0; 
+      
+      for index := 1 to 16   -- Display Ingredients to the screen
+      loop 
+        if IngredName[index]<>"" then
+          SetLabelText(6+index-1,IngredName[index]);
+          g_RecordCount:=g_RecordCount+1;
+          
+        else
+          SetLabelText(6+index-1,"");
+        end if;
+      end loop;
+                                                            
+      if g_Count>g_RecordCount-1 then
+        g_Count:=0;
+      elsif g_Count<0 then
+        g_Count:=g_RecordCount-1;
+      end if;  
+      
+      for index:= 0 to 15   -- Highlight the selected Ingredient
+      loop
+        if index=g_Count and g_RecordCount>0 then
+          SetLabelText(79+index,"-->>");
+          g_CurIngredient:=IngredName[index+1];
+        else
+          SetLabelText(79+index,"");
+        end if;
+      end loop; 
+      
+      if g_RecordCount>0 then       
+         SetSoftkeyText(1,"Delete Selected");
+         SetSoftkeyText(3,"Edit Selected");
+      else                       
+         SetSoftkeyText(1,"");             
+         SetSoftkeyText(3,"");
+      end if;                 
+      if g_RecordCount<16 then
+        SetSoftkeyText(2,"Add Ingredient");
+      else
+        SetSoftkeyText(2,"");
+      end if;
+      SetSoftkeyText(4,"Edit Total Weight"); 
+      SetSoftkeyText(5,"Done");  
+    
+  ---Select a ingredient to add to a Recipe  
+    elsif g_Level=6 then
+      SelectScreen(3);  
+      SetLabelText(Lbl17S3,"*** Select New Ingredient ***");       
+      SetLabelText(Lbl18S3,"For Recipe : "+g_CurrentRation);   
+      R_IngredName:=RationIngredients;
+      g_RecordCount :=0;
+      IngredDB.GetFirst;  
+      for g_RecordCount := 1 to g_MaxIngredients
+      loop
+        TempIngred[g_RecordCount]:=IngredDB.Name;
+        for index := 1 to g_MaxIngredients
+        loop
+          if TempIngred[g_RecordCount]=R_IngredName[index] then
+            TempIngred[g_RecordCount]:="";          
+          end if;
+        end loop;
+        IngredDB.GetNext;
+      end loop;
+                  
+      index:=1;
+      for g_RecordCount := 1 to g_MaxIngredients
+      loop
+        IngredName[g_RecordCount]:="";
+        if TempIngred[g_RecordCount]<>"" then
+          IngredName[index]:=TempIngred[g_RecordCount]; 
+          index:=index+1;
+        end if;
+      end loop;
+      if g_PageStart = 0 then
+          g_RecordCount:=0;  
+          for index := 1 to 16  
+          loop 
+            SetLabelText(6+index-1,IngredName[index]);
+            if IngredName[index]<>"" then
+                g_RecordCount:=g_RecordCount+1;
+            end if;  
+          end loop;
+              
+          if g_Count>15 then
+            g_Count:=0;
+          elsif g_Count<0 then
+            g_Count:=15;
+          end if;  
+            
+          for index:= 0 to 15
+          loop
+            if index=g_Count and g_RecordCount>0 then
+              SetLabelText(79+index,"-->>");
+              g_CurIngredient:=IngredName[index+1];
+            else
+              SetLabelText(79+index,"");                                  
+            end if;
+          end loop; 
+          SetSoftkeyText(1,"");             
+          SetSoftkeyText(2,"");      
+          SetSoftkeyText(3,"Add To Recipe");
+          SetSoftkeyText(4,"Page 2");  
+      else
+          g_RecordCount:=0;  
+          for index := 16 to 25  
+          loop 
+            SetLabelText(6+index-16,IngredName[index+1]);
+            if IngredName[index+1]<>"" then
+                g_RecordCount:=g_RecordCount+1;
+            end if;  
+          end loop;
+              
+          if g_Count>25 then
+            g_Count:=16;
+          elsif g_Count<16 then
+            g_Count:=25;
+          end if;  
+            
+          for index:= 16 to 25
+          loop
+            if index=g_Count and g_RecordCount>0 then
+              SetLabelText(79+index-16,"-->>");
+              g_CurIngredient:=IngredName[index+1];
+            else
+              SetLabelText(79+index-16,"");                                  
+            end if;
+          end loop;
+          
+          -- Clear Remaining Choices
+          for index:=10 to 15
+          loop
+              SetLabelText(79+index,"" );      
+              SetLabelText(6+index,"");
+          end loop; 
+          SetSoftkeyText(1,"");             
+          SetSoftkeyText(2,"");      
+          SetSoftkeyText(3,"Add To Recipe");
+          SetSoftkeyText(4,"Page 1");
+      end if;  
+      SetSoftkeyText(5,"Cancel");   
+
+--Edit Recipe ingredients info      
+    elsif g_Level=7 then
+      RationIngredDB.GetFirst;
+      loop
+        if RationIngredDB.Ration=g_CurrentRation and RationIngredDB.Ingred=g_CurIngredient then
+          exit;
+        end if;  
+        if  RationIngredDB.GetNext<>SysOk then
+          exit;
+        end if;  
+      end loop; 
+      SelectScreen(5);  
+      RationNamesDB.Name:=g_CurrentRation;
+      RationNamesDB.FindFirst(R_Names_Name);
+      SetLabelText(Lbl1S5,"Edit Ingredient For Recipe "+RationIngredDB.Ration);
+      SetLabelText(Lbl2S5,RationIngredDB.Ingred);
+      SetLabelText(Lbl9S5,"Target Weight for a "+IntegerToString(RationNamesDB.Total,0)+" lb load ");  
+      SetLabelText(Lbl5S5,IntegerToString(RationIngredDB.Target,0));
+      if g_FillStep > 1 then
+        
+        SetWidgetVisibility(lbl6s5,VOn);
+        SetWidgetVisibility(lbl3s5,VOn);
+        SetWidgetVisibility(lbl8s5,VOn);
+        
+        SetLabelText(Lbl6S5,IntegerToString(RationIngredDB.Min,0));
+        SetSoftkeyText(2,"Edit Cutoff Value");
+      
+      else
+        
+        SetWidgetVisibility(lbl6s5,VOff);
+        SetWidgetVisibility(lbl3s5,VOff);
+        SetWidgetVisibility(lbl8s5,VOff);
+        
+        SetSoftkeyText(2,"");
+      
+      end if;  
+      SetLabelText(Lbl10S5,IntegerToString(RationIngredDB.Max,0));
+      SetSoftkeyText(1,"Edit Target Weight");
+      SetSoftkeyText(3,"Edit Max Value");
+      SetSoftkeyText(4,"");
+      SetSoftkeyText(5,"Done");
+
+----Batching      
+    elsif g_Level=8 then -- Batching has started
+    
+       GetDigin(0,1,Bit);
+       if Bit=1 then --Estop has been pressed
+          SetLabelText(Lbl2S2,"Emergency Stop Pressed");
+          SetLabelText(Lbl3S2,"Batch Cannot Continue");
+          SetLabelText(Lbl4S2,"Until Emergency Stop");
+          SetLabelText(Lbl5S2,"Is Released");
+          SetSoftkeyText(1,"");
+          SetSoftkeyText(2,"");
+          SetSoftkeyText(3,"");
+          SetSoftkeyText(4,"");
+          SetSoftkeyText(5,"");
+          g_Level:=10; 
+       else
+          --Some times for some reason the system returns 101 for the current setpoint???       
+          if GetCurrentSP(CurrentSp)<>SysOk then 
+             WriteLn(2,"Error Getting SP");
+             CurrentSp := g_CurrentSp;      
+          end if;
+          WriteLn(2,"Setpoint = "+IntegerToString(CurrentSp,0));
+          if CurrentSp>100 then
+              WriteLn(2,"--------------------------");
+              WriteLn(2,"Current Setpoint > 100  =>"+IntegerToString(CurrentSP,0));
+              WriteLn(2,"--------------------------");
+             CurrentSp := g_CurrentSp;
+          end if;   
+          if CurrentSp =1 and g_CurrentSp>1  then
+              ResetBatch;
+              g_Level:=9;
+              
+          else
+              g_CurrentSp:=CurrentSp;
+              SelectScreen(2);
+              SetLabelText(Lbl2S2,"Loading Recipe "+g_CurrentRation);
+              -- WriteLn(2,"Current Setpoint "+IntegerToString(CurrentSp,0));
+              -- WriteLn(2,"g_WaitSp = "+IntegerToString(g_WaitSp,0));
+              index:=((CurrentSp-3)/5)+1;
+              Target:=g_SPValues[index];
+                   
+              if CurrentSp=1 then
+                 g_WaitSp:=0;  -- Resetting ingredient finished variable
+                 SetLabelText(Lbl3S2,"");
+                 SetLabelText(Lbl4S2,"Checking Zero..");
+                 SetLabelText(Lbl5S2,"");                     
+                 SetSoftkeyText(1,"Pause Batch");
+                 SetSoftkeyText(2,"");
+                 SetSoftkeyText(3,"");
+                 SetSoftkeyText(4,"");
+                 SetSoftkeyText(5,"");
+                       
+                   
+              elsif CurrentSp=3 or CurrentSp=8 or CurrentSp=13  --Wait Standstill Setpoints
+                 or CurrentSp=18 or CurrentSp=23 or CurrentSp=28 
+                 or CurrentSp=33 or CurrentSp=38 or CurrentSp=43
+                 or CurrentSp=48 or CurrentSp=53 or CurrentSp=58
+                 or CurrentSp=63 or CurrentSp=68 or CurrentSp=73
+                 or CurrentSp=78 
+                 then                 
+                   
+                   if g_WaitSp>0 then  -- Reset Wait Setpoint to Zero if starting new Fill. 
+                
+                     -- WriteLn(2,"g_WaitSp set to Zero");
+                     g_WaitSp:=0;
+                
+                   end if;
+                   -- WriteLn(2,"Waiting for Standstill... ");
+                   if g_SpOut[index]<99 then
+                       SetLabelText(Lbl3S2,"Settling Scale...");
+                   end if; 
+                   WriteLn(2,"Wait for Standstill");
+                   
+              elsif  CurrentSp=4 or CurrentSp=9 or CurrentSp=14  --Fast Fill Setpoints
+                 or CurrentSp=19 or CurrentSp=24 or CurrentSp=29 
+                 or CurrentSp=34 or CurrentSp=39 or CurrentSp=44
+                 or CurrentSp=49 or CurrentSp=54 or CurrentSp=59
+                 or CurrentSp=64 or CurrentSp=69 or CurrentSp=74
+                 or CurrentSp=79  
+                 then   
+                   
+                   WriteLn(2,"Fast Fill");
+                   g_CurIngredient := g_IngredNames[index];
+                                      
+                   GetSPValue(CurrentSp+2,CurSpValue);
+                   g_CurSpValue :=CurSpValue;
+                   GetSPValue(CurrentSp,CurSpValue);
+                   -- WriteLn(2,"Fast Filling Ingredient: "+g_CurIngredient);
+                   SetLabelText(Lbl3S2,"Fast Filling");
+                   SetLabelText(Lbl4S2,g_CurIngredient);
+                   SetLabelText(Lbl5S2,"Target = "+RealToString(Target,4,0));
+                   SetSoftkeyText(1,"Pause Batch");
+                   SetSoftkeyText(2,"");
+                   SetSoftkeyText(3,"");
+                   SetSoftkeyText(4,"");
+                   SetSoftkeyText(5,"");
+                   
+                   
+              elsif  CurrentSp=5 or CurrentSp=10 or CurrentSp=15    -- Wait Standstill
+                 or CurrentSp=20 or CurrentSp=25 or CurrentSp=30    
+                 or CurrentSp=35 or CurrentSp=40 or CurrentSp=45
+                 or CurrentSp=50 or CurrentSp=55 or CurrentSp=60
+                 or CurrentSp=65 or CurrentSp=70 or CurrentSp=75
+                  
+                 then 
+                   
+                   WriteLn(2,"Waiting for Standstill... ");
+                   SetLabelText(Lbl3S2,"Settling Scale...");
+                    
+        
+              elsif CurrentSp=6 or CurrentSp=11 or CurrentSp=16    -- Slow Fill Engaged
+                 or CurrentSp=21 or CurrentSp=26 or CurrentSp=31  
+                 or CurrentSp=36 or CurrentSp=41 
+                 then                                    
+                   WriteLn(2,"Slow Fill");
+                   if g_FillStep > 1 then
+                       -- WriteLn(2,"Slow Filling Ingredient: "+g_CurIngredient);
+                       GetSPValue(CurrentSp,CurSpValue);
+                       SetLabelText(Lbl3S2,"Slow Filling Ingredient");
+                       SetLabelText(Lbl4S2,g_CurIngredient);
+                       SetLabelText(Lbl5S2,"Target = "+RealToString(Target,4,0));
+                       SetSoftkeyText(1,"Pause Batch");
+                       SetSoftkeyText(2,"");
+                       SetSoftkeyText(3,"");
+                       SetSoftkeyText(4,"");
+                       SetSoftkeyText(5,"");
+                   end if;
+                  
+                 
+              elsif CurrentSp=7 or CurrentSp=12 or CurrentSp=17  -- Pause Setpoints
+                 or CurrentSp=22 or CurrentSp=27 or CurrentSp=32 -- This pauses the setpoints to make sure
+                 or CurrentSp=37 or CurrentSp=42 or CurrentSp=47
+                 or CurrentSp=52 or CurrentSp=57 or CurrentSp=62
+                 or CurrentSp=67 or CurrentSp=72 or CurrentSp=77
+                 then                                            -- They don't outdistance the code.
+                 
+                 WriteLn(2,"We Paused The Scale at Setpoint "+IntegerToString( CurrentSp,0)); 
+                 WriteLn(2,"Wait Sp = "+IntegerToString(g_WaitSp,0));
+                 if g_WaitSp<1 or g_WaitSp>1  then -- If first time or error occurred last time execute, otherwise skip
+                   RationIngredDB.GetFirst;
+                   loop
+                      if RationIngredDB.Ration=g_CurrentRation then
+                        WriteLn(2,"Current  g_WaitSp  => "+IntegerToString(g_WaitSp,0));
+                        WriteLn(2,"RationIngredDB.Ration = "+RationIngredDB.Ration);
+                        WriteLn(2,"g_CurrentRation       = "+g_CurrentRation);
+                        if RationIngredDB.Ingred=g_CurIngredient then
+                          g_WaitSp:=0;
+                          WriteLn(2,"Ingredient           = "+g_CurIngredient);
+                          WriteLn(2,"== Ingredient Match Found ==");
+                          exit;
+                        end if;
+                      end if;
+                      if RationIngredDB.GetNext<>SysOk then 
+                        SetLabelText(Lbl3S2,"** Not Found *# "+IntegerToString(g_WaitSp,0));
+                        SetLabelText(Lbl4S2,"Ing: "+g_CurIngredient);
+                        SetLabelText(Lbl5S2,"Recipe: "+g_CurrentRation);
+                        WriteLn(2,"** Ingredient Match NOT Found **");
+                        WriteLn(2,"Ingredient = "+g_CurIngredient);
+                        WriteLn(2,"Ration     = "+g_CurrentRation);
+                        g_SubLevel:=2;
+                        if g_WaitSp=0 then
+                          g_WaitSp:=2;  -- Flag for Error on Ingredient Load
+                        else
+                          g_WaitSp:=g_WaitSp+1;  -- g_WaitSp = One more than the number of fails 
+                        end if;
+                        WriteLn(2,"Wait Sp = "+IntegerToString(g_WaitSp,0));
+                        SetSoftkeyText(1,"");
+                        SetSoftkeyText(2,"Re-Try");
+                        SetSoftkeyText(3,"");
+                        SetSoftkeyText(4,"Cancel");
+                        SetSoftkeyText(5,"");
+                        exit;
+                      end if;          
+                   end loop;
+                   
+                   if g_WaitSp=0 then
+                     
+                     GetNet(scale1,Primary,Net);
+                   
+                     WriteLn(2,"Net "+IntegerToString(Net,0));
+                     WriteLn(2,"RationIngredDB.Target"+IntegerToString(RationIngredDB.Target,0));
+                     WriteLn(2,"RationIngredDB.Min"+IntegerToString(RationIngredDB.Min,0));
+                     WriteLn(2,"RationIngredDB.Max"+IntegerToString(RationIngredDB.Max,0));
+     
+      
+                     Factor:=GetFactor;
+                     Min:=(RationIngredDB.Target*Factor)- RationIngredDB.Min ;
+                     Max:=(RationIngredDB.Target*Factor)+ RationIngredDB.Max ;  
+          
+                   end if;  -- g_WaitSp 0 Statement     
+                   
+                 end if; -- g_WaitSp 0 or 2 if statement
+          
+                 if Net> Max and g_WaitSp=0 then  -- Only execute Over Limit Text ONCE!
+                   
+                   StopTimer(1);      
+                   WriteLn(2,"Net is Greater Than Max");    
+                   SetLabelText(Lbl3S2,"Error");
+                   SetLabelText(Lbl4S2,"Weight Above Max");
+                   SetLabelText(Lbl5S2,"Target := "+IntegerToString(RationIngredDB.Target*Factor,0)+" Max="+IntegerToString(Max,0));
+                   g_SubLevel:=2;
+                   SetSoftkeyText(1,"");
+                   SetSoftkeyText(2,"Resume");
+                   SetSoftkeyText(3,"");
+                   SetSoftkeyText(4,"Cancel");
+                   SetSoftkeyText(5,"");
+                   g_WaitSp:=1;
+                         
+                 else
+                   
+                   --if g_WaitSp=0 then    -- Only execute correct weight routine once.  
+                     
+                     WriteLn(2,"Wait within limit, should tare scale next");
+                     
+                     StoreLoad(0);
+                     TareScale;
+                     GetNet(scale1,Primary,Net);
+                     if Net > 5 then 
+                        WriteLn(2,"Tare Failed - Main Routine");
+                        g_SubLevel:=1;
+                        PauseBatch;
+                     end if;
+                   --end if;  
+                   g_WaitSp:=1;        -- Ingredient has finished set variable to flag this
+                   
+                   if g_SubLevel=1 then
+                     
+                     SelectScreen(1);
+                     SetLabelText(lbl2S1,"Unable to Tare Scale");
+                     SetLabelText(lbl3S1,"Batch Paused");
+                     SetLabelText(lbl4S1,"Tare Scale before resuming");
+                     SetSoftkeyText(1,"");
+                     SetSoftkeyText(2,"Resume");
+                     SetSoftkeyText(3,"Tare Scale");
+                     SetSoftkeyText(4,"Cancel");
+                     SetSoftkeyText(5,"");      
+                      
+                   else
+                    
+                     WriteLn(2,"StartBatch executing...");
+                     StartBatch;
+                     StartBatch;
+                     
+                   end if;
+                           
+                 end if; 
+                   
+                  
+                        
+                 
+                 
+              elsif CurrentSp=99 then
+                 
+                 WriteLn(2,"Setpoint 99 reached");
+                 g_Level:=9;
+                 g_SubLevel:=0;
+                 g_WaitSp:=0;      -- Reset g_WaitSp to 0 when batch finishes.
+                 ClearTare(scale1);                                        
+                 GetGross(scale1,Primary,gross);
+                 g_CurrentTarget:=Gross;
+              end if;
+                  
+          end if;
+             
+       end if;   
+    elsif g_Level=9 then       
+    
+      
+      SetLabelText(Lbl2S2,g_CurrentRation);
+      SetLabelText(Lbl3S2,"");
+      SetLabelText(Lbl4S2,"Ready To Discharge");
+      SetLabelText(Lbl5S2,"");
+      
+      SetSoftkeyText(1,"");
+      SetSoftkeyText(2,"");
+      SetSoftkeyText(3,"");
+      SetSoftkeyText(4,"");
+      SetSoftkeyText(5,"");
+      
+    elsif g_Level=10 then
+      g_Level:=8;
+      SelectScreen(1);
+      g_SubLevel:=1;                
+      PauseBatch;
+      SetLabelText(lbl2S1,"");
+      SetLabelText(lbl3S1,"Batch Paused");
+      SetLabelText(lbl4S1,"");
+      SetSoftkeyText(1,"");
+      SetSoftkeyText(2,"Resume");
+      SetSoftkeyText(3,"");
+      SetSoftkeyText(4,"Cancel");
+      SetSoftkeyText(5,"");                         
+    end if;     
+      
+    return;
+
+end;  
+
+procedure PromptForBatch;
+--Declaration Section
+
+begin
+      ClearTare(1);
+      --DisableSP(50); --Unload Setpoint
+      StopTimer(1);
+      StopTimer(2);
+      g_CurrentSp:=0;
+      g_CurrentTarget:=0;        
+      g_SubLevel:=0;
+      g_Level:=1;
+      StopBatch;
+      SetBatchingMode(Off);
+      
+    UpdateDisplay;
+    return;
+
+end;
+  
+
+
+
+
+---Used by the Rotary Encoder on the front of the panel to select an Item 
+
+ procedure SetCount;
+ --Declaration Section
+Bit1 : integer;
+Bit2 : integer;
+CurBitStatus : integer;
+
+ begin    
+     GetDigin(0,2,Bit1);
+     GetDigin(0,3,Bit2);
+     if Bit1=0 and Bit2=0 then
+        CurBitStatus:=0;
+     elsif Bit1=1 and Bit2=0 then
+        CurBitStatus:=1;
+     elsif Bit1=1 and Bit2=1 then
+        CurBitStatus:=2;
+     elsif Bit1=0 and Bit2=1 then
+        CurBitStatus:=3;
+     end if; 
+     
+     if g_BitStatus=0 and CurBitStatus=3 then
+        g_Count:=g_Count-1;
+     elsif g_BitStatus=3 and CurBitStatus=0 then
+        g_Count:=g_Count+1;
+     elsif g_BitStatus>CurBitStatus then
+        g_Count:=g_Count-1;
+     else
+        g_Count:=g_Count+1;
+     end if;     
+     
+     
+--     if g_Count>g_CountMax then
+--        g_Count:=0;                        
+--     end if;                       
+--     
+--     if g_Count<0 then
+--        g_Count:=g_CountMax;                        
+--     end if;   
+     g_BitStatus:=CurBitStatus;  
+     if g_Level=1 then 
+       g_CurrentTarget:=0;
+     end if;  
+     UpdateDisplay;
+     --SetLabelText(lbl2S1,"Count:= "+IntegerToString(g_Count,0));
+    return;
+
+ end;
+
+--------------------------------------------------------------------------------
+
+--                   Setup Stuff
+
+--------------------------------------------------------------------------------
+
+procedure DisplayIngredInfo;
+--Declaration Section
+
+begin
+
+    return;
+
+end;
+
+
+
+procedure DisplayRationInfo;
+--Declaration Section
+
+begin
+
+    return;
+
+end;
+                 
+procedure DisplaySetupInfo;
+--Declaration Section
+
+begin
+
+    return;
+
+end;
+                          
+                 
+
+
+
+
+
+
+
+
+
+
+
+
+-------------------------------------------------------------------------------
+
+--                  End of Setup Stuff
+
+------------------------------------------------------------------------------- 
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+-------------------------------------------------------------------------------
+
+--                       Batching Stuff
+
+------------------------------------------------------------------------------- 
+ 
+ --Set the Preact for the specified Ingredient based on the target Weight. 
+ --***THE TARGET WEIGHT IS THE GROSS WEIGHT***  The Target weight of the setpoint is the net weight
+ function Preact(Target:real; Ingredient : string) : real;
+--Declaration Section                                  
+X1:real;
+Y1:real;
+X2:real;
+Y2:real;
+Slope : real;
+B : real;    
+Retval:real;            
+Setup : SetupDatabase;
+Ingred : IngredDatabase;
+
+begin
+
+    Setup.GetFirst;
+    Ingred.Name:=Ingredient;
+    if Ingred.FindFirst(Ingred_Name)=SysOk then
+        X1:=0;
+        Y1:=ingred.Low_Act;
+        
+      --  X2:=Setup.MaxLoad;
+        X2:=160;
+      --  Y2:=ingred.High_Act+Setup.MaxLoad;
+      
+        Y2:=ingred.High_Act;
+        if X2/Y2 < 2 then
+          X2:=320;
+        end if;
+        Slope:=(Y2-Y1)/(X2-X1);  -- Find the slope
+        
+      --   ** Sean's Slope Routine  **
+      --  if X1-X2=0 then
+      --     RetVal:=0;
+      --  else
+        
+        
+        --   Slope:=(Y1-Y2)/(X1-X2);
+        --   B:=Y1-(Slope*X1);
+        --   if Slope<>0 then
+        --     Retval:=Target-((Target/Slope)-B);
+        --   else
+        --     RetVal:=0;
+        --     
+        --   end if;   
+           
+      --  end if;
+
+      if Target>X2 or Y1=Y2 then
+      
+        Retval:=Y2;
+      
+      else 
+        
+         Retval:=(Target*Slope)+Y1;
+        
+      end if;
+      
+      if Target < Retval+10 then     -- If the target weight is within 5 of returned then return half the target
+        
+        Retval:=Target/2;
+        
+      end if;
+      
+    else
+        Retval:=0;
+    end if;                             
+    
+    if RetVal<0 then 
+      Retval:=0;
+    end if;
+     -- WriteLn(2,"Ingredient - "+Ingredient);
+     -- WriteLn(2,"Target = "+IntegerToString(Target,0));
+     -- WriteLn(2,"Slow Target = "+IntegerToString(RetVal,0));
+       
+    return (Retval);
+
+end;
+ 
+ 
+
+procedure SetBatch;
+--Declaration Section
+Setpt : integer;
+SpValue : real;
+R_Names : R_NamesDatabase;
+R_Ingred : R_IngredDatabase;
+Ingred : IngredDatabase;               
+Loads : LoadsDatabase;  
+Found : integer;
+index : integer;
+ingcounter  : integer;    
+GrossTagret : integer;
+CurGross : real;
+Bit : integer;        
+CurPreact : real;                                  
+Factor : real;
+SetupDB :SetupDatabase;         
+Gross : real;
+fast : real;             -- Value for fast setpoint to be satisfied at
+cutoff : real;           -- Value for slow setpoint to be satisfied at
+BS : BatchStatus;
+
+begin
+
+    g_ScaleRationTargetWeight:=0;  -- Set Total Scale Dispensed weight to 0 
+    GetGross(Scale1,Primary,CurGross);
+    GetDigin(0,1,Bit);
+    if Bit=1 then
+       DisplayStatus("E-Stop Activated");
+    elsif CurGross<50 and CurGross >-50 then
+        --  Batch Start Selected, Display message to inform them that process has started
+        SelectScreen(1);
+        SetLabelText(Lbl2S1,"");
+        SetLabelText(Lbl3S1,"Initializing Batch");
+        SetLabelText(Lbl4S1,"");
+        DisplayStatus("Please Wait...");   
+        SetSoftkeyText(1,"");
+        SetSoftkeyText(2,""); 
+        SetSoftkeyText(3,"");
+        SetSoftkeyText(4,"");
+        SetSoftkeyText(5,"");
+        
+        SetWidgetVisibility(63,VOn);
+        
+        for index:=1 to 50
+        loop
+            
+            g_IngredNames[index]:="";
+            g_SPValues[Index]:=0;
+            g_SpPreact[Index]:=0;
+            g_SpMin[index]:=0;
+            g_SpMax[index]:=0;
+            g_SpOut[index]:=0;
+        
+        end loop;
+        
+        GrossTagret:=CurGross;
+        R_Names.Name:=g_CurrentRation;
+        R_Names.FindFirst(R_Names_Name);
+        
+        SetupDB.GetFirst;
+        if R_Names.Total > 0 then
+           Factor:=g_CurrentTarget/R_Names.Total;
+        else
+           Factor :=1;    
+        end if;
+        R_Ingred.Ration:=g_CurrentRation;
+        R_Ingred.FindFirst(1);
+        Index:=1;
+        loop
+                       
+            
+            GrossTagret:=0;
+            Ingred.Name:=R_Ingred.Ingred;
+            Write(2,"Looking for "+Ingred.Name);  
+            if Ingred.FindFirst(1)=SysOk then
+                
+                WriteLn(2," Found");
+                g_IngredNames[index]:=R_Ingred.Ingred; 
+                g_SPValues[index]:=R_Ingred.Target*Factor; 
+                GrossTagret:=g_SPValues[index];
+                g_ScaleRationTargetWeight:=g_ScaleRationTargetWeight + GrossTagret; 
+                g_SpOut[index]:=Ingred.Output; 
+                
+                -- Only figure First Cut Off if a value > 0 exists
+                if ingred.High_Act > 0 then  
+                    CurPreact:=Preact(GrossTagret,Ingred.Name);  
+                    g_SpPreact[index]:=CurPreact;
+                     
+                    
+                else
+                    CurPreact:=0;  
+                    g_SpPreact[index]:=0;
+                
+                end if;
+                
+                WriteLn(2,"------- "+IntegerToString(index,1)+" -------");
+                WriteLn(2,"Full Cutoff = "+RealToString(R_Ingred.Target,5,0));
+                WriteLn(2,"Factor      = "+RealToString(Factor,5,0));
+                WriteLn(2,"Set Cutoff  = "+RealToString(R_Ingred.Target*Factor,5,0));
+                WriteLn(2,"PreAct      = "+RealToString(CurPreact,5,0));
+                WriteLn(2,"Dig Output  = "+IntegerToString(g_SpOut[index],2));
+                WriteLn(2,"");
+                
+                if g_FillStep > 1 then
+                    g_SpMin[index]:=R_Ingred.Min;
+                end if;  
+                  
+                g_SpMax[index]:=R_Ingred.Max;  
+            
+            else
+                
+                WriteLn(2," Not Found");
+                SelectScreen(1);
+                SetLabelText(Lbl2S1,"Unable to Find");
+                SetLabelText(Lbl3S1,"Ration Ingredient");
+                SetLabelText(Lbl4S1,"- "+R_Ingred.Ingred+" -");
+                DisplayStatus("Check Ingredients");   
+                SetSoftkeyText(1,"");
+                SetSoftkeyText(2,""); 
+                SetSoftkeyText(3,"");
+                SetSoftkeyText(4,"");
+                SetSoftkeyText(5,"Cancel");      
+            
+            end if;      
+            
+            if R_Ingred.FindNext = SysOk then
+            
+                Index:=Index+1;
+                
+            else
+            
+                exit;
+                
+            end if;
+            
+        end loop;      
+                  
+         
+        --   ** Use the section to trouble shoot if your ingredients are not correct  **
+        --
+        -- WriteLn(2,"Total Weight Dispensed for Ration ="+RealToString(g_ScaleRationTargetWeight,4,0));
+        
+        -- for index:= 1 to 8
+        -- 
+        -- loop                    
+        --   
+          -- if g_IngredNames[index]<>"" then
+          --    
+          --   WriteLn(2,"Ingredients For Ration  "+g_CurrentRation);
+          --   WriteLn(2,"Index "+IntegerToString(index,0)+" Ingredient "+g_IngredNames[index]);
+          --   WriteLn(2,"     SPValue "+IntegerToString(g_SPValues[Index],0));
+          --   WriteLn(2,"     SPPreact "+IntegerToString(g_SpPreact[Index],0));
+          --   WriteLn(2,"     SPMin "+IntegerToString(g_SpMin[index],0));
+          --   WriteLn(2,"     SPMax "+IntegerToString(g_SpMax[index],0));
+          --   WriteLn(2,"  ");
+          --   WriteLn(2,"----------------------------------");
+          --
+          -- end if;
+          --  
+        -- end loop;        
+        
+        
+        for Setpt := 3 to 78 step 5
+        loop
+          index:=((Setpt-3)/5)+1;
+          -- WriteLn(2,"index"+IntegerToString(index,0)); 
+          if g_SPValues[index]>0 then
+            EnableSP(Setpt);
+            EnableSP(Setpt+1);
+            if g_FillStep > 1 then
+                
+                EnableSP(Setpt+2);
+                EnableSP(Setpt+3);          
+            
+                cutoff:=g_SPValues[index]-g_SpMin[index];
+            else
+                DisableSP(Setpt+2);
+                DisableSP(Setpt+3); 
+            end if;          
+            EnableSP(Setpt+4);          
+            
+            fast:=g_SPValues[index]-g_SpPreact[index];
+            
+            if fast > cutoff and g_FillStep > 1 then   -- Catch if the fast setpoint is greater than the cutoff on slow sp
+              
+              cutoff:=g_SPValues[index];
+              
+            end if;
+            -- Not checking for single or dual stage output here. SP+3 is disabled if g_FillStep=1
+            WriteLn(2,"Fast = "+IntegerToString(Setpt+1,2)+" - "+RealToString(fast,4,0));
+            SetSPValue(Setpt+1,fast);
+            SetSPValue(Setpt+3,cutoff);
+            SetSPPreact(Setpt,0);
+            SetSPPreact(Setpt+2,0);
+            
+          else                   
+          
+            DisableSP(Setpt);
+            DisableSP(Setpt+1);
+            DisableSP(Setpt+2);
+            DisableSP(Setpt+3);
+            DisableSP(Setpt+4);            
+          
+          end if;  
+        
+        end loop; 
+        Found:=0;
+        g_Load:=1;    
+        if Loads.GetFirst=SysOk then
+           loop     
+              if Date$(Loads.Date)=Date$(SystemTime) then
+                 if g_Load = Loads.Load then
+                   Found :=1;
+                 end if; 
+              end if; 
+              if Loads.GetNext<>SysOk or Found=1 then
+                if Found =0 then
+                  exit;
+                else 
+                  g_Load:=g_Load+1;
+                  Found :=0; 
+                  Loads.GetFirst; 
+                end if;   
+              end if;  
+           end loop;
+        end if;
+        
+        SetBatchingMode(Manual);  
+        ResetBatch;
+        StartBatch;
+        
+        GetBatchStatus(BS);
+                           
+        if BS = BatchRunning then                   
+                         
+            StartTimer(1);
+            StartTimer(2);
+            
+        else 
+        
+            StartTimer(3);
+            
+        end if;
+        
+        
+        ClearTare(1);   
+        GetGross(Scale1,Primary,Gross);
+        if Gross <=0 then
+          ZeroScale(scale1);
+        else
+        
+          g_StartingWeight:=Gross;
+          AcquireTare(Scale1);    
+          
+        end if;
+        
+        DisplayStatus("");
+        g_Level:=8;           
+        UpdateDisplay;
+        
+    else  
+    
+        WriteLn(2,"Scale Not at Zero");
+        SelectScreen(1);
+        SetLabelText(Lbl2S1,"");
+        SetLabelText(Lbl3S1,"Scale Not At Zero");
+        SetLabelText(Lbl4S1,"");
+        DisplayStatus("Zero Scale To Continue");   
+        SetSoftkeyText(1,"");
+        SetSoftkeyText(2,""); 
+        SetSoftkeyText(3,"Start Batch");
+        SetSoftkeyText(4,"");
+        SetSoftkeyText(5,"Cancel");
+    end if;        
+    return;
+
+end;
+
+
+
+
+-------------------------------------------------------------------------------
+
+--                   End Of Batching Stuff
+
+------------------------------------------------------------------------------- 
+
+procedure PausetheBatch;
+--Declaration Section
+
+begin
+
+    g_SubLevel:=1;
+    StopTimer(1);                
+    PauseBatch;
+    DisplayStatus("Batch Paused");
+    SetSoftkeyText(1,"");
+    SetSoftkeyText(2,"Resume");
+    SetSoftkeyText(3,"");
+    SetSoftkeyText(4,"Cancel");
+    SetSoftkeyText(5,""); 
+    return;
+    
+end;
+
+
+
+
+
+
+  -- End of functions and procedures.
+  ----------------------------------------------------------------------------
+
+
+
+
+
+
+  ----------------------------------------------------------------------------
+  -- Begin event handler definitions here.                                    
+  
+handler Cmd1Handler;
+--Declaration Section
+LoadsDB : LoadsDatabase;
+begin
+   if LoadsDB.GetFirst<>SysOk then
+      WriteLn(EventPort,"EMPTY DATABASE");
+   else
+     WriteLn(EventPort,"BEGIN DATABASE");
+     loop
+         WriteLn(EventPort,Date$(LoadsDB.Date)+" "+Time$(LoadsDB.Date)+","+
+                          IntegerToString(LoadsDB.Load,0)+","+
+                          LoadsDB.Ingred+","+
+                          IntegerToString(LoadsDB.Target,0)+","+
+                          IntegerToString(LoadsDB.Actual,0)+","+
+                          LoadsDB.Ration+","+
+                          IntegerToString(LoadsDB.Sent,0)+","+
+                          IntegerToString(LoadsDB.Status,0));
+        LoadsDB.Sent:=1;
+        LoadsDB.Update;
+        if LoadsDB.GetNext<>SysOk then
+          exit;
+        end if;  
+        
+     end loop;
+     WriteLn(EventPort,"END DATABASE");
+   end if;    
+   return;
+
+end;         
+
+handler Cmd2Handler;
+--Declaration Section
+Cnt : integer;          
+LoadsDB : LoadsDatabase;
+begin                   
+    Cnt:=0;
+    if LoadsDB.GetFirst<>SysOk then
+      WriteLn(EventPort,"EMPTY DATABASE");
+    else
+      WriteLn(EventPort,"CLEARING DATABASE");
+      loop
+        if LoadsDB.Sent=1 then
+           LoadsDB.Delete;
+        end if;
+        if LoadsDB.GetNext<>SysOk then
+           exit;
+        end if;  
+      end loop;
+      WriteLn(EventPort,"DATABASE CLEARED");
+    end if;  
+    return;
+
+end;
+
+
+handler Navupkeypressed;
+--Declaration Section
+
+begin
+    g_Count:=g_Count-1;
+    if g_Level=1 then 
+       g_CurrentTarget:=0;
+    end if;  
+    
+    UpdateDisplay;
+    return;
+
+end;      
+
+
+handler Navdownkeypressed;
+--Declaration Section
+
+begin
+    g_Count:=g_Count+1;   
+    if g_Level=1 then 
+       g_CurrentTarget:=0;
+    end if;  
+
+    UpdateDisplay;
+
+    return;
+
+end;
+
+
+
+  
+handler User1Keypressed;
+--Declaration Section
+R_IngredDB :R_IngredDatabase;  
+Bit : integer;
+begin    
+    GetDigin(0,1,Bit);
+    if g_Level=1 and Bit=0 then          
+       g_SubLevel:=1;
+      
+       SelectScreen(10);
+       SetLabelText(Lbl1S10,"Enter Total Load Weight");
+       SetLabelText(Lbl2S10,"For Recipe");
+       SetLabelText(Lbl3S10,g_CurrentRation);
+       SetLabelText(Lbl4S10,"Current Value");
+       SetLabelText(Lbl5S10,IntegerToString(g_CurrentTarget,0));
+       PromptUser("Total");
+       DisableHandlers;                             
+    elsif g_Level=2 and g_SubLevel=0 and g_CurrentRation <>"" then
+      g_SubLevel:=1;                              
+      UpdateDisplay;         
+    elsif g_Level=2 and g_SubLevel=1 then 
+      g_SubLevel:=0;
+      UpdateDisplay;  
+    elsif g_Level=3 then --Select Recipe To Edit
+      g_Level:=2;    
+      g_Count:=0;
+      UpdateDisplay;  
+    elsif g_Level=4 then  
+      g_SubLevel:=1;
+      SelectScreen(10);
+      SetLabelText(Lbl1S10,"");
+      SetLabelText(Lbl2S10,"Edit Ingredient Name");
+      SetLabelText(Lbl3S10,"Current Name");
+      SetLabelText(Lbl4S10,g_CurIngredient);
+      SetLabelText(Lbl5S10,"");
+      PromptUser("Name");
+      DisableHandlers;   
+    elsif g_Level=5 and g_CurIngredient<>"" then  --Delete Ingredient from Recipe
+         
+      R_IngredDB.GetFirst;
+      loop
+        if R_IngredDB.Ingred=g_CurIngredient and R_IngredDB.Ration=g_CurrentRation then
+          R_IngredDB.Delete;
+          exit;
+        end if;
+        if R_IngredDb.GetNext<>SysOk then 
+          exit;
+        end if;      
+      end loop;
+      g_Count:=g_Count-1;
+      UpdateDisplay;
+      
+    elsif g_Level=7 then
+      SelectScreen(10);
+      R_IngredDB.GetFirst;
+      loop
+        if R_IngredDB.Ingred=g_CurIngredient and R_IngredDB.Ration=g_CurrentRation then
+          exit;
+        end if;
+        if R_IngredDb.GetNext<>SysOk then 
+          exit;
+        end if;      
+      end loop;  
+      
+      SetLabelText(Lbl1S10,"Set Target For");
+      SetLabelText(Lbl2S10,"Recipe "+R_IngredDB.Ration);
+      SetLabelText(Lbl3S10,R_IngredDB.Ingred); 
+      SetLabelText(Lbl4S10,"Current Target");  
+      SetLabelText(Lbl5S10,IntegerToString(R_IngredDB.Target,0)); 
+      g_SubLevel:=1;
+      PromptUser("Target");
+      
+    elsif g_Level=8 and g_SubLevel=0 then
+      --SelectScreen(1); 
+      WriteLn(2,"Key 1 Pressed");
+      g_SubLevel:=1;
+      StopTimer(1);                
+      PauseBatch;
+      DisplayStatus("Batch Paused");
+      SetSoftkeyText(1,"");
+      SetSoftkeyText(2,"Resume");
+      SetSoftkeyText(3,"");
+      SetSoftkeyText(4,"Cancel");
+      SetSoftkeyText(5,""); 
+    elsif g_Level=9 then
+      PromptForBatch;
+    end if;
+       
+
+    return;
+
+end;
+
+  
+handler User2Keypressed;
+--Declaration Section
+IngredDB : IngredDatabase;    
+R_IngredDB : R_IngredDatabase;
+begin
+    if g_Level=2 and g_Count<g_MaxRations then
+       g_SubLevel:=2;   
+       SetLabelText(lbl1S10,"New Recipe");
+       SetLabelText(lbl2S10,"Key In Recipe");
+       SetLabelText(lbl3S10,"Name");
+       SetLabelText(lbl4S10,"Then Press Enter");                        
+       SetLabelText(lbl5S10,"");   
+       PromptUser("Name");
+       DisableHandlers; 
+     elsif g_Level=3 then --Select Ingred To Edit
+       g_Level:=4;
+       g_SubLevel:=0;    
+       g_Count:=0;        
+       UpdateDisplay;
+     elsif g_Level=4 and g_CurIngredient<>"" then
+        g_SubLevel:=2;
+        IngredDB.Name:=g_CurIngredient;
+        IngredDb.FindFirst(Ingred_Name);
+        SelectScreen(10);
+        SetLabelText(Lbl1S10,"");
+        SetLabelText(Lbl2S10,"Edit High Preact For");
+        SetLabelText(Lbl3S10,g_CurIngredient);
+        SetLabelText(Lbl4S10,"Current Value");
+        SetLabelText(Lbl5S10,RealToString(IngredDB.High_Act,0,1));
+        PromptUser("High Preact");
+        DisableHandlers;
+     elsif g_Level=5 and g_RecordCount<g_MaxIngredients then
+        g_Count:=0;
+        g_Level:=6;
+        UpdateDisplay;   
+    elsif g_Level=7 then
+      SelectScreen(10);
+      R_IngredDB.GetFirst;
+      loop
+        if R_IngredDB.Ingred=g_CurIngredient and R_IngredDB.Ration=g_CurrentRation then
+          exit;
+        end if;
+        if R_IngredDb.GetNext<>SysOk then 
+          exit;
+        end if;      
+      end loop;  
+      
+      SetLabelText(Lbl1S10,"Set Early Cutoff Amount For");
+      SetLabelText(Lbl2S10,"Recipe "+R_IngredDB.Ration);
+      SetLabelText(Lbl3S10,R_IngredDB.Ingred); 
+      SetLabelText(Lbl4S10,"Current Value");  
+      SetLabelText(Lbl5S10,IntegerToString(R_IngredDB.Min,0)); 
+      g_SubLevel:=2;
+      PromptUser("Cutoff");        
+     elsif g_Level=8 and g_SubLevel=1 then 
+       --WriteLn(2,"Key 2 Pressed");
+       StartBatch;
+       StartTimer(1);
+       g_SubLevel:=0;
+       UpdateDisplay;
+     elsif g_Level=8 and g_SubLevel=2 then
+       
+       StoreLoad(0);     
+       TareScale;
+       
+       StartBatch;
+       g_SubLevel:=0;
+       StartTimer(1);
+       UpdateDisplay;
+             
+     end if;     
+     
+    return;
+
+end;
+
+handler User3Keypressed;
+--Declaration Section
+IngredDB : IngredDatabase; 
+R_IngredDB : R_IngredDatabase;
+RatIng_Ration : stringarray;
+RatIng_Ingredient : stringarray;
+RatIng_Target : realarray;
+RatIng_Min : realarray;
+RatIng_Max : realarray;
+Index : integer;
+Ingredient_Count : integer;
+Count : integer;
+
+begin
+    if g_Level=0 then
+      g_Level:=1; --Select Recipe              
+      UpdateDisplay;     
+    elsif g_Level=1 then     
+      SetLabelText(lbl1S10,"");
+      SetLabelText(lbl2S10,"");
+      SetLabelText(lbl3S10,"Loading");
+      SetLabelText(lbl4S10,"Recipe");
+      SetLabelText(lbl5S10,"Wait");
+      SetSoftkeyText(3,"");
+      SetBatch;  
+    elsif g_Level=2 then -- Selected The Recipe To Edit
+      g_Level:=5;
+      UpdateDisplay;  
+    elsif g_Level=3 then
+      KeyPress(TimeDateKey);   
+    elsif g_Level=4  and g_CurIngredient<>"" then
+      g_SubLevel:=3;
+      IngredDB.Name:=g_CurIngredient;
+      IngredDb.FindFirst(Ingred_Name);
+      SelectScreen(10);
+      SetLabelText(Lbl1S10,"");
+      SetLabelText(Lbl2S10,"Edit Output For");
+      SetLabelText(Lbl3S10,g_CurIngredient);
+      SetLabelText(Lbl4S10,"Current Value");
+      SetLabelText(Lbl5S10,RealToString(IngredDB.Output,0,1));
+      PromptUser("Output # >");
+      DisableHandlers;    
+    elsif g_Level=5 and g_CurIngredient<>"" then
+      g_Level:=7;
+      UpdateDisplay;     
+
+    elsif g_Level=6 then
+      
+      --  First save the new ingredient to the database
+      R_IngredDB.Ration:=g_CurrentRation;
+      R_IngredDB.Ingred:=g_CurIngredient;
+      R_IngredDB.Target:=0;
+      R_IngredDB.Min:=0;
+      R_IngredDB.Max:=0;
+      R_IngredDB.Add;
+      WriteLn(2,g_CurIngredient+" Ingredient Saved to DB");
+      --  Second Load in all the records for the ration into an array
+      R_IngredDB.GetFirst;
+      Index:=0;
+      loop
+        
+        if R_IngredDB.Ration=g_CurrentRation then
+          
+          Index:=Index+1;
+          RatIng_Ration[Index]:=R_IngredDB.Ration;
+          RatIng_Ingredient[Index]:=R_IngredDB.Ingred;
+          RatIng_Target[Index]:=R_IngredDB.Target;
+          RatIng_Min[Index]:=R_IngredDB.Min;
+          RatIng_Max[Index]:=R_IngredDB.Max;
+          
+        end if;
+        
+        if R_IngredDb.GetNext<>SysOk or Index=g_MaxIngredients then
+        
+          WriteLn(2,"Number of Ingredients for Recipe: "+g_CurrentRation);
+          WriteLn(2,"--> "+IntegerToString(index,0)); 
+          exit;
+        end if;      
+      
+      end loop;
+  
+      -- Commenting out this section.  Need Ingredients in entered order
+      -- Third Erase the ration from the database
+--      R_IngredDB.GetFirst;
+--      loop
+--        
+--        if R_IngredDB.Ration=g_CurrentRation then
+--          
+--          WriteLn(2,R_IngredDB.Ingred+" deleted.");
+--          R_IngredDB.Delete;
+--          
+--        end if;
+--        
+--        if R_IngredDb.GetNext<>SysOk then 
+--          exit;
+--        end if;      
+--        
+--      end loop;
+--                                                                      
+      -- Fourth Save all the ingredients for the ration to the database.
+--      
+--      IngredDB.GetFirst;
+--      Count:=0;
+--      
+--      while Count<Index+1  
+--      loop
+--       
+--        -- This loop goes through ingredients one at a time in order  
+--        if IngredDB.Name<>"" then
+--        
+--          for Ingredient_Count:=1 to index  --  This loops through the ingredients for the Recipe
+--          loop
+--            
+--            WriteLn(2,IngredDb.Name+" ------- "+RatIng_Ingredient[Ingredient_Count]);
+--
+--            --  If a match is found add it to the DB then start on the next ingredient
+--            if RatIng_Ingredient[Ingredient_Count] = IngredDB.Name then
+--                        
+--              R_IngredDB.Ration:=RatIng_Ration[Ingredient_Count];
+--              R_IngredDB.Ingred:=RatIng_Ingredient[Ingredient_Count];
+--              R_IngredDB.Target:=RatIng_Target[Ingredient_Count];
+--              R_IngredDB.Min:=RatIng_Min[Ingredient_Count];
+--              R_IngredDB.Max:=RatIng_Max[Ingredient_Count];
+--              R_IngredDB.Add;
+--              WriteLn(2,RatIng_Ingredient[Ingredient_Count]+" Added to DB");
+--              Ingredient_Count:=index;
+--              Count:=Count+1;
+--              
+--            end if;
+--          
+--          end loop;  
+--        
+--        end if;
+--            
+--        if IngredDb.GetNext<>SysOk then 
+--          
+--          Count:=Index+1;                                                                     
+--          
+--        end if;
+--      
+--      end loop;
+--      
+      g_level:=5;
+      g_Count:=0;
+      --WriteLn(2,"Updating Display.");
+      UpdateDisplay;   
+ 
+    elsif g_Level=7 then
+      SelectScreen(10);
+      R_IngredDB.GetFirst;
+      loop
+        if R_IngredDB.Ingred=g_CurIngredient and R_IngredDB.Ration=g_CurrentRation then
+          exit;
+        end if;
+        if R_IngredDb.GetNext<>SysOk then 
+          exit;
+        end if;      
+      end loop;  
+      
+      SetLabelText(Lbl1S10,"Set Maximum Acceptable lbs For");
+      SetLabelText(Lbl2S10,"Recipe "+R_IngredDB.Ration);
+      SetLabelText(Lbl3S10,R_IngredDB.Ingred); 
+      SetLabelText(Lbl4S10,"Current Value");  
+      SetLabelText(Lbl5S10,IntegerToString(R_IngredDB.Max,0)); 
+      g_SubLevel:=3;
+      PromptUser("Max");
+    elsif g_Level=8 and g_SubLevel=1 and g_WaitSp=1 then
+      if AcquireTare(Scale1)=SysOk then
+        SetLabelText(lbl2S1,"Tare Successful");
+        SetLabelText(lbl3S1,"Batch Paused");
+        SetLabelText(lbl4S1,"Please Press Resume");
+      end if;
+    elsif g_Level=9 and g_SubLevel=0 then
+      UnloadToTruck;                
+      
+    elsif g_Level=9 and g_SubLevel=3 then
+      SetLabelText(Lbl3S2,"***Paused***");
+      SetLabelText(Lbl4S2,"Unloading");
+      SetLabelText(Lbl5S2,"Tank");
+      g_SubLevel:=0;
+      SetSoftkeyText(1,"Cancel");
+      SetSoftkeyText(2,"");
+      SetSoftkeyText(3,"Restart");
+      SetSoftkeyText(4,"");
+      SetSoftkeyText(5,"");   
+      DisableSP(50);                        
+    end if;  
+    return;
+
+end;
+
+handler User4Keypressed;
+--Declaration Section
+RationNamesDB :R_NamesDatabase;
+begin
+    WriteLn(2,"4 key pressed");
+    if g_Level = 4 then
+        if g_SubLevel = 0 then
+            g_PageStart:=1;
+            g_Count:=16;
+            UpdateDisplay;
+            
+        else
+            g_PageStart:=0;
+            g_Count:=0;
+            UpdateDisplay;
+        end if;
+    
+    elsif g_Level=5 then     
+      RationNamesDB.Name:= g_CurrentRation;
+      RationNamesDB.FindFirst(R_Names_Name);
+      SelectScreen(6);
+      g_SubLevel:=4;          
+      SetLabelText(Lbl6S6,"Current total weight for Recipe : "+RationNamesDB.Name);
+      SetLabelText(Lbl7S6,IntegerToString(RationNamesDB.Total,0)+" lbs");
+      PromptUser("Total Weight");
+      DisableHandlers;
+      
+    elsif g_Level=6 then
+        if g_SubLevel = 0 then
+            g_PageStart:=1;
+            g_Count:=16;
+            UpdateDisplay;
+        else
+            g_PageStart:=0;
+            g_Count:=0;
+            UpdateDisplay;
+        end if;
+         
+    elsif g_Level=8 and g_SubLevel=1 then
+       ResetBatch;
+       g_SubLevel:=0;
+       g_Level:=0;
+       UpdateDisplay;    
+    elsif g_Level=8 and g_SubLevel=2 then
+       ResetBatch;
+       StoreLoad(1);           
+       g_SubLevel:=0;
+       g_Level:=0;
+       UpdateDisplay;    
+       
+    end if; 
+    return;
+
+end;
+
+
+
+handler User5Keypressed;
+--Declaration Section
+RNamesDB :R_NamesDatabase;
+RIngredDB : R_IngredDatabase;
+begin
+    if g_Level=0 then
+       g_Level:=3;
+       g_CurrentTarget:=0;   
+    elsif g_Level=1 and g_SubLevel=0 then
+      g_Count:=0; 
+      g_Level:=0;
+    elsif g_Level=2 and g_SubLevel=0 then
+      g_Count:=0; 
+      g_Level:=3;
+    elsif g_Level=1 or g_Level=2 and g_SubLevel=1 then 
+       RNamesDB.Name:=g_CurrentRation;
+       RNamesDB.FindFirst(R_Names_Name);
+       RNamesDB.Delete;
+       RIngredDB.Ration:=g_CurrentRation;
+       loop
+           if RIngredDB.FindFirst(R_Ingred_Ration)<>SysOk then
+             exit;
+           end if;
+           RIngredDB.Delete;  
+       end loop;
+       g_SubLevel:=0;                    
+    elsif g_Level=3 then
+        g_Level:=0;     
+        g_Count:=0;  
+    elsif g_Level=4 then
+        g_Level:=3;
+        g_Count:=0;
+    elsif g_Level=5 then
+        g_Level:=3;
+        g_Count:=0;
+    elsif g_Level=6 or g_Level=7 then
+       g_Level:=5;
+       g_Count:=0;       
+    end if;
+         
+    
+    UpdateDisplay;    
+    return;
+
+end;
+
+
+
+
+
+
+ handler Numerickeypressed;
+----Declaration Section
+
+begin
+
+    return;
+
+end;
+
+
+
+ handler Userentry;
+--Declaration Section
+UserString :string;
+UserReal : real;
+EntryString : string; 
+R_IngredDB : R_IngredDatabase;
+RationNamesDB : R_NamesDatabase; 
+IngredDB :IngredDatabase;  
+Total : integer;  
+OriginalName : string;
+index : integer;   
+Ok : integer;
+begin                              
+    UserString := GetEntry;
+    ClosePrompt;          
+    EnableHandelers;
+    UserReal:=StringToReal(UserString);
+    if EventKey = EnterKey   then          
+      if g_Level=2 and g_SubLevel=2 then
+        if UserString<>""then
+          RationNamesDB.Name:=UserString;
+          if RationNamesDB.FindFirst(R_Names_Name)=SysOk then
+            DisplayStatus("Name Already Used");        
+          else
+            RationNamesDB.Name:=UserString;
+            RationNamesDB.Add;         
+            g_CurrentRation:=UserString;
+            RationNamesDb.GetFirst;
+            g_Count:=0;
+            if RationNamesDb.Name<>g_CurrentRation then
+              loop
+                g_Count:=g_Count+1;
+                RationNamesDb.GetNext;
+                if RationNamesDb.Name=g_CurrentRation then
+                  exit;
+                end if;    
+                
+              end loop;
+            end if;
+          end if;   
+        end if;             
+        
+--Edit total Target for Load                   
+        
+      elsif g_Level=1 and g_SubLevel=1 then
+        if UserReal>0 then
+          RationNamesDB.Name:=g_CurrentRation;
+          RationNamesDB.FindFirst(R_Names_Name);
+          if UserReal>RationNamesDB.Total then
+            DisplayStatus("Cannot Be > "+IntegerToString(RationNamesDB.Total,0));
+          else
+            g_CurrentTarget:=UserReal;    
+          end if;  
+          
+        end if;                           
+--Edit Ingredient Name           
+      elsif g_Level=4 and g_SubLevel=1 then    
+        if UserString<>"" then 
+          Ok:=0;
+          for index:= 0 to g_MaxIngredients-1
+          loop
+            if index=0 then 
+                IngredDB.GetFirst;
+            else
+                IngredDB.GetNext; 
+            end if;
+            if g_Count<>index and UCase$(ingredDB.Name)=UCase$(UserString) then
+                DisplayStatus("Name Already Used");
+                OK:=1;
+                exit;
+            end if;
+          end loop;   
+          
+          
+          
+          if Ok=0 then
+            for index:= 0 to g_MaxIngredients-1
+              loop
+              if index=0 then 
+                IngredDB.GetFirst;
+              else
+                IngredDB.GetNext; 
+              end if;
+              if g_Count=index then
+                OriginalName:=IngredDB.Name;
+                IngredDB.Name:=UserString;   
+                INgredDB.Update;
+                exit;
+              end if;
+            end loop; 
+            
+            if R_IngredDB.GetFirst=SysOk then
+               loop
+                   WriteLn(2,R_IngredDB.Ingred+"  "+OriginalName);
+                   if R_IngredDB.Ingred=OriginalName and OriginalName<>"" then
+                       R_IngredDB.Ingred:=UserString; 
+                       R_IngredDB.Update;  
+                   end if;   
+                   if R_IngredDB.GetNext<>SysOk then
+                       exit;
+                   end if;  
+               end loop;
+            end if;
+              
+          end if;
+        end if;                             
+        
+        
+        
+--Edit Ingredient High Preact
+      elsif g_Level=4 and g_SubLevel=2 then    
+        if UserString<>"" then 
+          IngredDB.Name:=g_CurIngredient;
+          IngredDb.FindFirst(Ingred_Name);        
+          IngredDB.High_Act:=UserReal;
+          IngredDB.Update;
+        end if;
+        
+--Edit Ingredient Output
+      elsif g_Level=4 and g_SubLevel=3 then    
+        if UserString<>"" then 
+          IngredDB.Name:=g_CurIngredient;
+          IngredDb.FindFirst(Ingred_Name);        
+          IngredDB.Output:=StringToInteger(UserString);
+          IngredDB.Update;
+        end if;      
+        
+--Edit Total        
+      elsif g_Level=5 and g_SubLevel=4 then            
+         WriteLn(2,RealToString(userreal,0,3));
+        if UserReal >0 then      
+        
+          RationNamesDB.Name:= g_CurrentRation;
+          RationNamesDB.FindFirst(R_Names_Name);
+          RationNamesDB.Total:=UserReal;
+          RationNamesDB.Update;
+        end if;
+      elsif g_Level=7 and g_SubLevel=1 then
+          if UserReal>=0 then   
+            Total:=0;
+            R_IngredDB.GetFirst;
+            loop
+            if R_IngredDB.Ingred<>g_CurIngredient and R_IngredDB.Ration=g_CurrentRation then
+              Total:=Total+R_IngredDB.Target;
+            end if;
+            if R_IngredDb.GetNext<>SysOk then 
+              exit;
+            end if;      
+            end loop;  
+          
+          
+          
+            R_IngredDB.GetFirst;
+            loop
+            if R_IngredDB.Ingred=g_CurIngredient and R_IngredDB.Ration=g_CurrentRation then
+              exit;
+            end if;
+            if R_IngredDb.GetNext<>SysOk then 
+              exit;
+            end if;      
+            end loop;
+            Total:=Total+R_IngredDB.Target;  
+            RationNamesDB.Name:=g_CurrentRation;
+            RationNamesDB.FindFirst(R_Names_Name);
+            if RationNamesDB.Total<Total+UserReal-R_IngredDB.Target then
+               DisplayStatus("Cannot exceed Total");
+            else
+               R_IngredDB.Target:=UserReal;
+               R_IngredDB.Update;
+            end if;   
+               
+          end if;    
+--Set Early Target Cutoff for Ration ingredient          
+     elsif g_Level=7 and g_SubLevel=2 then
+          if UserReal>=0 then   
+            R_IngredDB.GetFirst;
+            loop
+            if R_IngredDB.Ingred=g_CurIngredient and R_IngredDB.Ration=g_CurrentRation then
+              exit;
+            end if;
+            if R_IngredDb.GetNext<>SysOk then 
+              exit;
+            end if;      
+            end loop;
+            R_IngredDB.Min:=UserReal;
+            R_IngredDB.Update;
+          end if;
+
+--Set Max Accepatible for Recipe ingredient          
+     elsif g_Level=7 and g_SubLevel=3 then
+          if UserReal>=0 then   
+            R_IngredDB.GetFirst;
+            loop
+            if R_IngredDB.Ingred=g_CurIngredient and R_IngredDB.Ration=g_CurrentRation then
+              exit;
+            end if;
+            if R_IngredDb.GetNext<>SysOk then 
+              exit;
+            end if;      
+            end loop;
+            R_IngredDB.Max:=UserReal;
+            R_IngredDB.Update;
+          end if;
+
+                    
+      end if;    
+      g_SubLevel:=0;     
+      
+      
+    else
+       DisplayStatus("");
+    end if;                    
+    UpdateDisplay;
+    return;
+end;    
+
+
+
+handler Digins0B1DeActivate; --EStop Activated
+--Declaration Section
+BS : BatchStatus;
+begin
+    GetBatchStatus(BS);
+    if BS= BatchRunning then
+      PauseBatch;
+    end if;
+    g_Bit:=1; 
+    UpdateDisplay; 
+    return;
+
+end;
+
+
+handler Digins0B1Activate; --EStop DeActivated
+--Declaration Section
+BS : BatchStatus;
+begin  
+    g_Bit:=0;
+    UpdateDisplay; 
+    return;
+
+end;
+
+
+
+
+
+
+  
+handler Digins0B2Activate; --Select Switch Bit 1 Activated
+--Declaration Section
+
+begin
+    SetCount;
+    return;
+
+end;
+
+
+
+handler Digins0B3Activate; --Select Switch Bit 2 Activated
+--Declaration Section
+
+begin
+    SetCount;
+    return;
+
+end;
+
+handler Digins0B2DeActivate; --Select Switch Bit 1 Activated
+--Declaration Section
+
+begin
+    SetCount;
+    return;
+
+end;
+
+
+
+handler Digins0B3DeActivate; --Select Switch Bit 2 Activated
+--Declaration Section
+
+begin
+    SetCount;
+    return;
+
+end;
+
+handler Sp1Trip;
+--Declaration Section
+
+begin
+
+    UpdateDisplay;
+    return;
+    
+end;
+
+
+handler Sp3Trip;
+--Declaration Section
+state   : integer;
+
+begin
+    
+    if g_SpOut[1]<17 then
+        SetDigout(2,g_SpOut[1],1);
+    elsif g_SpOut[1]=99 then 
+        
+        SetLabelText(Lbl3S2,"Hand Filling");
+        SetLabelText(Lbl4S2,g_IngredNames[1]);
+        SetLabelText(Lbl5S2,"Target = "+RealToString(g_SPValues[1],4,0));
+        PausetheBatch;
+        
+    end if;
+    
+    
+    UpdateDisplay;
+    return;
+
+end;       
+
+handler Sp4Trip;
+--Declaration Section
+state   : integer;
+
+begin
+    
+    if g_SpOut[1]<17 then
+        SetDigout(2,g_SpOut[1],0);
+    end if;
+    UpdateDisplay;
+    return;
+
+end;       
+
+handler Sp5Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;       
+
+handler Sp6Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;       
+
+handler Sp7Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;       
+
+handler Sp8Trip;
+--Declaration Section
+
+begin
+    if g_SpOut[2]<17 then
+    
+        SetDigout(2,g_SpOut[2],1);
+    
+    elsif g_SpOut[2]=99 then
+        
+        SetLabelText(Lbl3S2,"Hand Filling");
+        SetLabelText(Lbl4S2,g_IngredNames[2]);
+        SetLabelText(Lbl5S2,"Target = "+RealToString(g_SPValues[2],4,0));
+        
+        PausetheBatch;
+        
+    end if;
+    UpdateDisplay;
+    return;
+
+end;       
+
+handler Sp9Trip;
+--Declaration Section
+
+begin
+    
+    if g_SpOut[2]<17 then
+        SetDigout(2,g_SpOut[2],0);
+    end if;
+    UpdateDisplay;
+    return;
+
+end;       
+
+handler Sp10Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp11Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+
+handler Sp12Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp13Trip;
+--Declaration Section
+
+begin
+    if g_SpOut[3]<17 then
+        SetDigout(2,g_SpOut[3],1);
+    elsif g_SpOut[3]=99 then 
+        
+        SetLabelText(Lbl3S2,"Hand Filling");
+        SetLabelText(Lbl4S2,g_IngredNames[3]);
+        SetLabelText(Lbl5S2,"Target = "+RealToString(g_SPValues[3],4,0));
+        
+        PausetheBatch;
+        
+    end if;
+    UpdateDisplay;
+    return;
+
+end;
+
+
+handler Sp14Trip;
+--Declaration Section
+
+begin
+    if g_SpOut[3]<17 then
+        SetDigout(2,g_SpOut[3],0);
+    end if;
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp15Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp16Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp17Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp18Trip;
+--Declaration Section
+
+begin
+    if g_SpOut[4]<17 then
+        SetDigout(2,g_SpOut[4],1);
+    elsif g_SpOut[4]=99 then 
+        
+        SetLabelText(Lbl3S2,"Hand Filling");
+        SetLabelText(Lbl4S2,g_IngredNames[4]);
+        SetLabelText(Lbl5S2,"Target = "+RealToString(g_SPValues[4],4,0));
+        
+        PausetheBatch;
+        
+    end if;
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp19Trip;
+--Declaration Section
+
+begin
+    if g_SpOut[4]<17 then
+        SetDigout(2,g_SpOut[4],0);
+    end if;
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp20Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;
+        
+handler Sp21Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;       
+
+handler Sp22Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+
+handler Sp23Trip;
+--Declaration Section
+
+begin
+    
+    if g_SpOut[5]<17 then
+        SetDigout(2,g_SpOut[5],1);
+    elsif g_SpOut[5]=99 then 
+        
+        SetLabelText(Lbl3S2,"Hand Filling");
+        SetLabelText(Lbl4S2,g_IngredNames[5]);
+        SetLabelText(Lbl5S2,"Target = "+RealToString(g_SPValues[5],4,0));
+        
+        PausetheBatch;
+        
+    end if;
+
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp24Trip;
+--Declaration Section
+
+begin
+    if g_SpOut[5]<17 then
+        SetDigout(2,g_SpOut[5],0);
+    end if;
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp25Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp26Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp27Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp28Trip;
+--Declaration Section
+
+begin
+    if g_SpOut[6]<17 then
+        SetDigout(2,g_SpOut[6],1);
+    elsif g_SpOut[6]=99 then 
+        
+        SetLabelText(Lbl3S2,"Hand Filling");
+        SetLabelText(Lbl4S2,g_IngredNames[6]);
+        SetLabelText(Lbl5S2,"Target = "+RealToString(g_SPValues[6],4,0));
+        
+        PausetheBatch;
+        
+    end if;
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp29Trip;
+--Declaration Section
+
+begin
+    if g_SpOut[6]<17 then
+        SetDigout(2,g_SpOut[6],0);
+    end if;
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp30Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp31Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    
+    return;
+
+end;       
+
+handler Sp32Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;         
+
+handler Sp33Trip;
+--Declaration Section
+
+begin
+    if g_SpOut[7]<17 then
+        SetDigout(2,g_SpOut[7],1);
+    elsif g_SpOut[7]=99 then 
+        
+        SetLabelText(Lbl3S2,"Hand Filling");
+        SetLabelText(Lbl4S2,g_IngredNames[7]);
+        SetLabelText(Lbl5S2,"Target = "+RealToString(g_SPValues[7],4,0));
+        
+        PausetheBatch;
+        
+    end if;
+    UpdateDisplay;
+    return;
+
+end;                   
+
+
+handler Sp34Trip;
+--Declaration Section
+
+begin
+    if g_SpOut[7]<17 then
+        SetDigout(2,g_SpOut[7],0);
+    end if;
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp35Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;
+
+            
+handler Sp36Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;                   
+
+handler Sp37Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp38Trip;
+--Declaration Section
+
+begin
+    if g_SpOut[8]<17 then
+        SetDigout(2,g_SpOut[8],1);
+    elsif g_SpOut[8]=99 then 
+        
+        SetLabelText(Lbl3S2,"Hand Filling");
+        SetLabelText(Lbl4S2,g_IngredNames[8]);
+        SetLabelText(Lbl5S2,"Target = "+RealToString(g_SPValues[8],4,0));
+        
+        PausetheBatch;
+        
+    end if;
+    UpdateDisplay;
+    return;
+
+end;                   
+
+handler Sp39Trip;
+--Declaration Section
+
+begin
+    if g_SpOut[8]<17 then
+        SetDigout(2,g_SpOut[8],0);
+    end if;
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp40Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;                   
+
+            
+handler Sp41Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;        
+
+handler Sp42Trip;
+--Declaration Section
+
+begin
+    UpdateDisplay;
+    return;
+
+end;                   
+
+handler Sp43Trip;
+
+begin
+
+    if g_SpOut[9]<17 then
+        SetDigout(2,g_SpOut[9],1);
+    elsif g_SpOut[9]=99 then 
+        
+        SetLabelText(Lbl3S2,"Hand Filling");
+        SetLabelText(Lbl4S2,g_IngredNames[9]);
+        SetLabelText(Lbl5S2,"Target = "+RealToString(g_SPValues[9],4,0));
+        
+        PausetheBatch;
+        
+    end if;
+    UpdateDisplay;
+    return;
+    
+end;
+
+handler Sp44Trip;
+
+begin
+
+    if g_SpOut[9]<17 then
+        SetDigout(2,g_SpOut[9],0);
+    end if;
+    UpdateDisplay;
+    return;
+    
+end;
+
+
+handler Sp45Trip;
+
+begin
+
+    UpdateDisplay;
+    return;
+    
+end;
+
+
+handler Sp46Trip;
+
+begin
+
+    UpdateDisplay;
+    return;
+    
+end;
+
+
+handler Sp47Trip;
+
+begin
+
+    UpdateDisplay;
+    return;
+    
+end;
+
+
+handler Sp48Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[10],1);
+    UpdateDisplay;
+    return;
+    
+end;
+
+handler Sp49Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[10],0);
+    UpdateDisplay;
+    return;
+    
+end;
+
+
+handler Sp50Trip;
+
+begin
+
+    UpdateDisplay;
+    return;
+    
+end;
+
+
+handler Sp51Trip;
+
+begin
+
+    UpdateDisplay;
+    return;
+    
+end;
+
+
+handler Sp52Trip;
+
+begin
+
+    UpdateDisplay;
+    return;
+    
+end;
+
+
+handler Sp53Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[11],1);
+    UpdateDisplay;
+    return;
+    
+end;
+
+handler Sp54Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[11],0);
+    return;
+    
+end;
+
+handler Sp58Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[12],1);
+    return;
+    
+end; 
+
+handler Sp59Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[12],0);
+    return;
+    
+end;
+
+handler Sp63Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[13],1);
+    return;
+    
+end;
+
+handler Sp64Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[13],0);
+    return;
+    
+end;
+
+
+handler Sp68Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[14],1);
+    return;
+    
+end;
+
+handler Sp69Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[14],0);
+    return;
+    
+end;
+
+
+handler Sp73Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[15],1);
+    return;
+    
+end;
+
+handler Sp74Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[15],0);
+    return;
+    
+end;
+
+
+handler Sp78Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[16],1);
+    return;
+    
+end;
+
+handler Sp79Trip;
+
+begin
+
+    SetDigout(2,g_SpOut[16],0);
+    return;
+    
+end;
+
+
+handler Sp99Trip;
+--Declaration Section
+
+begin
+    WriteLn(2,"Setpoint 99 Tripped");               
+    PromptForBatch;
+    return;
+
+end;                   
+           
+
+            
+           
+
+
+
+
+            
+           
+
+
+
+handler Timer1Trip;--Update Display
+--Declaration Section
+CurrentSp : integer;
+BS : BatchStatus;
+
+begin  
+    
+    GetBatchStatus(BS);
+    if g_Level=8 or g_Level=9 then
+        
+        if BS= BatchPaused and g_SubLevel=0 then
+            WriteLn(2,"Batch Should be running but is paused.");
+        elsif BS = BatchRunning and g_SubLevel=0 then 
+            WriteLn(2,"Batch is running"); 
+        elsif BS = BatchComplete and g_SubLevel=0 then
+            WriteLn(2,"Batch is Complete"); 
+        elsif BS = BatchStopped and g_SubLevel=0 then
+            WriteLn(2,"Batch is Stopped"); 
+            
+        end if;
+        UpdateDisplay;   
+
+    end if;
+    return;
+
+end;
+
+
+handler Timer2Trip;--Update BarGraph
+--Declaration Section
+Net : real;       
+Gross : real;
+CorrectedWeight : real;
+CurrentSp : integer;              
+BLevel : integer;
+BLevel2 : integer;
+Index   : integer;
+Target  : real; 
+--BS : BatchStatus;
+
+begin   
+    
+    --GetBatchStatus(BS);
+    -- If batch is paused and we are in batch menu and we have not manually paused the batch
+    -- Start the timer to start the batch.
+    --if BS= BatchPaused and g_Level=8 and g_SubLevel=0 then
+        --StartTimer(1);
+    --end if;
+    GetGross(Scale1,Primary,gross);
+    CorrectedWeight:=Gross - g_StartingWeight;
+    GetCurrentSP(CurrentSp);
+    if g_Level=8 then
+        
+        index:=((CurrentSp-3)/5)+1;
+        Target:=g_SPValues[index];
+              
+        GetNet(Scale1,Primary,Net); 
+        
+        if Target > 0 then
+            BLevel:=(Net/Target)*100;
+            --WriteLn(2,IntegerToString(BLevel,0));
+        end if;
+        SetLabelText(lbl14s2,RealToString(CorrectedWeight,5,0));
+        SetLabelText(lbl9s2,RealToString(g_ScaleRationTargetWeight,5,0));
+                
+    elsif g_Level=9 then
+      
+        if g_CurrentTarget>0 then
+            BLevel:=(Gross/g_CurrentTarget)*100;
+--            WriteLn(2,"Gross = "+RealToString(gross,4,0));
+--            WriteLn(2,"gTarg = "+RealToString(g_CurrentTarget,4,0));
+--            WriteLn(2,"Level = "+IntegerToString(BLevel,4));
+--            
+        else
+            BLevel:=0;
+        end if;        
+    
+    end if;
+
+--  Commented Out Section is for a second Bargraph if customer wants one.
+--    
+--    if g_ScaleRationTargetWeight>0 then
+--      
+--      BLevel2:=(Gross/g_ScaleRationTargetWeight)*100;
+--
+--    else
+--    
+--      BLevel2:=0;
+--    
+--    end if;        
+
+    if BLevel>100 then 
+       BLevel:=100;
+    end if;
+--    if BLevel2>100 then 
+--       BLevel2:=100;
+--    end if;              
+    SetBargraphLevel(Bar1S2,BLevel);
+--    SetBargraphLevel(Bar2S2,BLevel2);
+    return;
+
+end;
+
+handler Timer3Trip;  -- Batch Status Check
+--Declaration Section
+BS  : BatchStatus;
+
+begin
+
+    GetBatchStatus(BS);
+    
+    if BS <> BatchRunning then
+    
+        WriteLn(2,"Batch Not Running yet");
+        StartBatch;
+        StartTimer(3);
+    
+    else
+        
+        WriteLn(2,"Batch is now Running.");
+        DisplayStatus("");
+        g_Level:=8;           
+        UpdateDisplay;
+            
+    end if;
+    return;
+    
+end;
+
+  -- End of event handlers.
+  ----------------------------------------------------------------------------
+
+   
+
+
+------------------------------------------------------------------------------
+-- This chunk of code is the system startup event handler.
+
+begin
+  SetTimer(1,40);
+  SetTimerMode(1,TimerContinuous);
+  --StartTimer(1);
+  SetTimer(2,50);
+  SetTimerMode(2,TimerContinuous);
+  --StartTimer(2);
+  SetTimer(3,100);
+  SetTimerMode(3,TimerOneShot);
+  
+   
+  -- Initialize all global variables here. 
+  WriteLn(2,"Initialization Started.");
+  InitializeDatabase;   
+  UpdateDisplay;     
+  -- Display the version number to the display.
+  DisplayVersion;
+   
+
+end Mill_Batcher; 
+-- This name must match the name following "program" keyword at 
+-- the beginning of the program.
+

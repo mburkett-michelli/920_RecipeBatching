@@ -1,0 +1,2 @@
+MinLoad	MaxLoad	FillStep
+500.000000	31000.000000	1
